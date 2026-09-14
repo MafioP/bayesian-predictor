@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Trained checkpoints and generated output -- regenerate with main.py / inference.py
+*.pt
+predictions.png
