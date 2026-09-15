@@ -5,23 +5,32 @@ without retraining.
 
 Usage:
     python main.py                    # trains DistanceNetMobileNet (MC Dropout), same as before
-    python main.py --model variational  # trains DistanceNetMobileNetVariational (Bayes by Backprop)
+    python main.py --model variational  # trains DistanceNetMobileNetVariational (hand-rolled Bayes by Backprop)
+    python main.py --model blitz        # trains DistanceNetMobileNetBlitz (BLiTZ's Bayes by Backprop)
+    python main.py --model der          # trains DistanceNetMobileNetDER (Deep Evidential Regression)
 
-Training both under their default checkpoint names lets
-compare_uncertainty.py load both and compare their epistemic estimates on
-the same images.
+Training all four under their default checkpoint names lets
+compare_uncertainty.py load them together and compare their uncertainty
+estimates on the same images.
 """
 
 import argparse
 
 import torch
 
-from model import DistanceNetMobileNet, DistanceNetMobileNetVariational
+from model import (
+    DistanceNetMobileNet,
+    DistanceNetMobileNetVariational,
+    DistanceNetMobileNetBlitz,
+    DistanceNetMobileNetDER,
+)
 from train import train
 
 MODEL_CHOICES = {
     "dropout": DistanceNetMobileNet,
     "variational": DistanceNetMobileNetVariational,
+    "blitz": DistanceNetMobileNetBlitz,
+    "der": DistanceNetMobileNetDER,
 }
 
 # The "dropout" default keeps its original filename so existing checkpoints
@@ -29,6 +38,8 @@ MODEL_CHOICES = {
 DEFAULT_CHECKPOINTS = {
     "dropout": "distance_net.pt",
     "variational": "distance_net_variational.pt",
+    "blitz": "distance_net_blitz.pt",
+    "der": "distance_net_der.pt",
 }
 
 

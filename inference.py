@@ -40,6 +40,28 @@ def predict_with_uncertainty(
 
     image: a single (1, H, W) tensor, values in [0, 1].
     """
+    if getattr(model, "is_evidential", False):
+        # Deep Evidential Regression (DistanceNetMobileNetDER) needs no
+        # sampling loop at all: a single deterministic forward pass
+        # already gives every parameter needed for both uncertainty
+        # types, via closed-form properties of the fitted
+        # Normal-Inverse-Gamma distribution -- see model.py's docstring.
+        model.eval()
+        with torch.no_grad():
+            out = model(image.unsqueeze(0).to(device))
+        loc = out["loc"].item()
+        lmbda = out["lmbda"].item()
+        alpha = out["alpha"].item()
+        beta = out["beta"].item()
+        aleatoric_var = beta / (alpha - 1)
+        epistemic_var = beta / ((alpha - 1) * lmbda)
+        return {
+            "mean": loc,
+            "epistemic_std": epistemic_var ** 0.5,
+            "aleatoric_std": aleatoric_var ** 0.5,
+            "total_std": (epistemic_var + aleatoric_var) ** 0.5,
+        }
+
     if hasattr(model, "kl_divergence"):
         # Variational (BayesianLinear) models sample fresh weights on
         # every forward call regardless of train/eval mode, so eval() is

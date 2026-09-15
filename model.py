@@ -23,6 +23,9 @@ per-pass aleatoric estimate.
 import torch
 import torch.nn as nn
 from torchvision.models import mobilenet_v3_small, MobileNet_V3_Small_Weights
+from blitz.modules import BayesianLinear as BlitzBayesianLinear
+from blitz.utils import variational_estimator
+from torch_uncertainty.layers.distributions import NormalInverseGammaLinear
 
 from dataset import MIN_DISTANCE, MAX_DISTANCE
 from variational import BayesianLinear
@@ -207,10 +210,217 @@ class DistanceNetMobileNetVariational(nn.Module):
         return sum(m.kl_divergence() for m in self.modules() if isinstance(m, BayesianLinear))
 
 
+@variational_estimator
+class DistanceNetMobileNetBlitz(nn.Module):
+    """
+    Same idea as DistanceNetMobileNetVariational (Bayes by Backprop head on
+    the frozen MobileNetV3-Small backbone), but using blitz-bayesian-pytorch's
+    BayesianLinear instead of this project's own hand-rolled one in
+    variational.py -- letting a maintained library own the weight-sampling
+    and KL-divergence math instead of hand-rolling it.
+
+    Two concrete differences from variational.BayesianLinear, both from the
+    library rather than a deliberate design choice here:
+    - BLiTZ's prior is a scale mixture of two Gaussians (Blundell et al.'s
+      original paper uses this too), not the single Gaussian this project
+      wrote by hand -- generally a better-behaved prior for Bayes by
+      Backprop.
+    - The @variational_estimator decorator adds sample_elbo(), which
+      averages the loss over several weight samples per training step.
+      train.py uses this for this model instead of a single forward pass
+      per step -- directly testing the "average over multiple weight
+      samples" hypothesis flagged as the likely fix for
+      DistanceNetMobileNetVariational's unresolved aleatoric collapse
+      (see SESSION_NOTES.md, Obstacle E).
+
+    Uses BLiTZ's own default prior/posterior-init hyperparameters
+    (prior_sigma_1=0.1, prior_sigma_2=0.4, prior_pi=1, posterior_rho_init=
+    -7.0) rather than this project's own values -- tried loosening them
+    once (posterior_rho_init=-3.0, prior_pi=0.5, prior_sigma_2=1.0) to fix
+    a collapsed, near-zero epistemic estimate seen with the defaults, and
+    it made things considerably worse: the mean branch collapsed into a
+    narrow low band and aleatoric_std blew up to 250-375, both worse than
+    with the defaults. Likely cause: BLiTZ's nn_kl_divergence() is a
+    Monte Carlo estimate (log_posterior(w) - log_prior(w) at the actual
+    *sampled* weight w), not the closed-form KL variational.py computes
+    from mu/sigma directly -- widening sigma widened the range of sampled
+    weights, which widened the variance of that log-density estimate
+    itself, adding noise to the exact mechanism (sample_elbo's per-sample
+    KL term) this model relies on for stability. Reverted; the epistemic
+    collapse with defaults is a known, smaller-severity open item (see
+    README.md) rather than something to fix by changing several priors
+    at once again.
+    """
+
+    def __init__(
+        self,
+        freeze_backbone: bool = True,
+        prior_sigma_1: float = 0.1,
+        prior_sigma_2: float = 0.4,
+        prior_pi: float = 1.0,
+        posterior_rho_init: float = -7.0,
+    ):
+        super().__init__()
+        weights = MobileNet_V3_Small_Weights.IMAGENET1K_V1
+        backbone = mobilenet_v3_small(weights=weights)
+
+        blitz_kwargs = dict(
+            prior_sigma_1=prior_sigma_1,
+            prior_sigma_2=prior_sigma_2,
+            prior_pi=prior_pi,
+            posterior_rho_init=posterior_rho_init,
+        )
+        self.backbone = backbone.features
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.head = nn.Sequential(
+            nn.Flatten(),
+            BlitzBayesianLinear(576, 64, **blitz_kwargs),
+            nn.ReLU(),
+            BlitzBayesianLinear(64, 2, **blitz_kwargs),  # (mean, log_var)
+        )
+
+        self.freeze_backbone = freeze_backbone
+        if freeze_backbone:
+            for p in self.backbone.parameters():
+                p.requires_grad = False
+
+        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.freeze_backbone:
+            self.backbone.eval()
+        return self
+
+    def forward(self, x):
+        if x.size(1) == 1:
+            x = x.repeat(1, 3, 1, 1)  # grayscale -> fake RGB
+        x = (x - self.mean) / self.std
+        x = self.backbone(x)
+        x = self.pool(x)
+        x = self.head(x)
+        pred_mean, raw_log_var = x.unbind(dim=-1)
+        self.last_raw_log_var = raw_log_var.detach()  # for train.py's per-epoch diagnostics
+        log_var = _soft_clamp_log_var(raw_log_var)
+        return pred_mean, log_var
+
+    def kl_divergence(self) -> torch.Tensor:
+        """Thin wrapper around the nn_kl_divergence() that
+        @variational_estimator adds, so train.py/inference.py's existing
+        hasattr(model, "kl_divergence") checks work for this model too
+        without needing to special-case BLiTZ specifically."""
+        return self.nn_kl_divergence()
+
+
+class DistanceNetMobileNetDER(nn.Module):
+    """
+    Same frozen MobileNetV3-Small backbone as the other models, but the
+    head predicts the four parameters (loc, lmbda, alpha, beta) of a
+    Normal-Inverse-Gamma (NIG) distribution instead of a (mean, log_var)
+    pair, following Deep Evidential Regression (Amini et al., 2020,
+    "Deep Evidential Regression"). Uses torch-uncertainty's
+    NormalInverseGammaLinear layer.
+
+    This is a genuinely different mechanism from every other model here:
+    no dropout, no weight resampling, no multi-sample inference loop. A
+    SINGLE deterministic forward pass gives everything needed for both
+    uncertainty types, via closed-form properties of the fitted NIG
+    distribution:
+        aleatoric_var = beta / (alpha - 1)           -- expected data noise
+        epistemic_var = beta / ((alpha - 1) * lmbda)  -- roughly, how much
+                                                          "evidence" the
+                                                          model has seen
+                                                          for this input
+    (see torch_uncertainty.utils.distributions.NormalInverseGamma's
+    mean_variance/variance_loc properties). inference.py's
+    predict_with_uncertainty checks the is_evidential flag set below to
+    skip its MC-sampling loop entirely for this model -- there's nothing
+    to sample.
+
+    forward() returns the raw parameter dict (each value shaped
+    (batch, 1), the NormalInverseGammaLinear layer's native output),
+    unlike every other model's (pred_mean, log_var) tuple -- train.py and
+    inference.py both branch on is_evidential specifically because this
+    output shape and the loss that consumes it (DERLoss, not
+    BetaNLLLoss) are genuinely different, not just a different set of
+    numbers through the same interface.
+
+    min_alpha/min_lmbda raised well above NormalInverseGammaLinear's own
+    default of 1e-6. DERLoss's regularizer (reg_weight * |target - loc| *
+    (2*lmbda + alpha)) is *supposed* to shrink alpha/lmbda whenever the
+    prediction is wrong -- that's the intended mechanism, not a bug, since
+    low evidence is how this loss represents "I don't know." The actual
+    problem: a full training run showed alpha and lmbda pinned at exactly
+    their floor for all 50 epochs regardless of reg_weight (tried both
+    1e-2 and a 100x-larger 1.0, with no change in where they land) --
+    because this task's residual is essentially never zero, so that
+    pressure never lets up. Both uncertainty formulas divide by these
+    values, so a 1e-6 floor turns "the model is unsure" into "the variance
+    is astronomically large and useless" (epistemic_std in the tens of
+    thousands was observed). Raising the floor doesn't stop evidence from
+    shrinking -- it bounds how extreme the consequence of that shrinking
+    can be.
+    """
+
+    def __init__(
+        self,
+        freeze_backbone: bool = True,
+        min_alpha: float = 0.05,
+        min_lmbda: float = 0.05,
+    ):
+        super().__init__()
+        weights = MobileNet_V3_Small_Weights.IMAGENET1K_V1
+        backbone = mobilenet_v3_small(weights=weights)
+
+        self.backbone = backbone.features
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.trunk = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(576, 64),
+            nn.ReLU(),
+        )
+        # out_features is set internally to 4 * event_dim by this layer --
+        # only in_features is passed through to the underlying nn.Linear.
+        self.nig_head = NormalInverseGammaLinear(
+            nn.Linear, event_dim=1, in_features=64, min_alpha=min_alpha, min_lmbda=min_lmbda
+        )
+
+        self.freeze_backbone = freeze_backbone
+        if freeze_backbone:
+            for p in self.backbone.parameters():
+                p.requires_grad = False
+
+        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
+        # Marks this model for train.py/inference.py's evidential-specific
+        # branches -- see the class docstring for why this can't just
+        # reuse the (pred_mean, log_var) interface the other models share.
+        self.is_evidential = True
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.freeze_backbone:
+            self.backbone.eval()
+        return self
+
+    def forward(self, x):
+        if x.size(1) == 1:
+            x = x.repeat(1, 3, 1, 1)  # grayscale -> fake RGB
+        x = (x - self.mean) / self.std
+        x = self.backbone(x)
+        x = self.pool(x)
+        x = self.trunk(x)
+        return self.nig_head(x)  # dict: loc, lmbda, alpha, beta, each (batch, 1)
+
+
 # Lets checkpoints record which class they belong to, so inference.py can
 # rebuild the right architecture without the caller having to know it.
 MODEL_REGISTRY = {
     "DistanceNet": DistanceNet,
     "DistanceNetMobileNet": DistanceNetMobileNet,
     "DistanceNetMobileNetVariational": DistanceNetMobileNetVariational,
+    "DistanceNetMobileNetBlitz": DistanceNetMobileNetBlitz,
+    "DistanceNetMobileNetDER": DistanceNetMobileNetDER,
 }

@@ -358,3 +358,358 @@ instead of sharing one with `mean`; averaging the loss over several
 weight samples per training step to directly reduce the gradient noise
 implicated above; or a separate, smaller learning rate for the log_var
 output specifically.
+
+---
+
+## Part 5 — Letting a library own the math: BLiTZ
+
+After Part 4 we had a variational model with a working mean, a working
+epistemic estimate, and a permanently stuck aleatoric branch, with no
+obvious next hyperparameter to try by hand. Rather than keep debugging
+`variational.py`'s `BayesianLinear` indefinitely, we swapped it for the
+equivalent layer from [BLiTZ](https://github.com/piEsposito/blitz-bayesian-deep-learning)
+(`blitz-bayesian-pytorch`), a maintained library implementing the same
+Bayes by Backprop idea, as `DistanceNetMobileNetBlitz` in `model.py`.
+Learning goal at this point had shifted from "understand the mechanism by
+hand" (Part 4's point) to "offload the parts that are now just plumbing."
+
+**What's different from the hand-rolled version:**
+- BLiTZ uses a *scale mixture of two Gaussians* prior (`prior_sigma_1`,
+  `prior_sigma_2`, `prior_pi`) instead of a single Gaussian — what
+  Blundell et al.'s original paper actually proposes.
+- Decorating the model with `@variational_estimator` adds `sample_elbo()`,
+  which runs `elbo_sample_nbr` (default 3) forward passes per training
+  step and averages both the NLL and the KL term over them, instead of
+  one pass. `train.py` uses this automatically whenever
+  `hasattr(model, "sample_elbo")`. This was the direct test of "average
+  over several weight samples," the fix flagged as not-yet-tried at the
+  end of Part 4.
+- `kl_divergence()` on the new model is a one-line wrapper around BLiTZ's
+  own `nn_kl_divergence()`, so `train.py`/`inference.py`'s existing
+  `hasattr(model, "kl_divergence")` checks needed no changes at all.
+
+### Obstacle F: BLiTZ's own defaults produced a collapsed epistemic estimate
+
+**Symptom:** a full training run with BLiTZ's own default hyperparameters
+produced a mean that tracked `true` well and an `aleatoric_std` that
+varied meaningfully across images (66-85 in one test batch) — real
+confirmation that the multi-sample-training hypothesis from Part 4 was
+correct. But `epistemic_std` came out tiny (0.05-0.10) for every single
+image, versus 40-70 for the other models.
+
+**Why:** two of BLiTZ's own defaults. `posterior_rho_init=-7.0` starts
+every weight's `sigma` far tighter than the hand-rolled model ever used.
+`prior_pi=1` makes the "scale mixture" prior collapse to a single
+`N(0, 0.01)`, since a mixing weight of exactly 1 zeroes out the second
+component entirely. Both push toward a posterior with little reason to
+grow.
+
+**Fix tried, and why it backfired badly:** loosened three parameters at
+once — `posterior_rho_init=-3.0`, `prior_pi=0.5`, `prior_sigma_2=1.0`.
+This broke the model far more severely than the problem it was meant to
+fix: the mean collapsed into a narrow, input-independent band, and
+`aleatoric_std` blew up to 250-375. Two mistakes, worth separating:
+
+1. Changed three hyperparameters simultaneously instead of one at a time
+   — the exact "isolate one variable" discipline that got Part 4 unstuck
+   wasn't applied here.
+2. The specific direction chosen fought a real mechanism: BLiTZ's
+   `nn_kl_divergence()` is a **Monte Carlo estimate**
+   (`log_posterior(w) - log_prior(w)` evaluated at the actual *sampled*
+   weight `w`), not the closed-form KL the hand-rolled model computes
+   directly from `mu`/`sigma`. Widening `sigma` widens the range of
+   weights that get sampled, which widens the variance of that
+   log-density estimate itself — so loosening the posterior didn't just
+   allow more epistemic spread, it added noise directly to the mechanism
+   (`sample_elbo`'s per-sample KL term) this model depends on for the
+   stability it was specifically brought in to demonstrate.
+
+Reverted to BLiTZ's defaults.
+
+**Where it landed:** `DistanceNetMobileNetBlitz` ships with BLiTZ's own
+defaults — mean and aleatoric both work, epistemic is under-informative
+but not corrupting the other two outputs. Not yet revisited; if it is,
+change `posterior_rho_init`/`prior_pi`/`prior_sigma_2` one at a time, and
+expect the Monte-Carlo-KL mechanism to be more sensitive to loosening
+than the closed-form version in `variational.py` was.
+
+---
+
+## Part 6 — A fundamentally different mechanism: Deep Evidential Regression
+
+Every model so far gets its epistemic estimate the same way: perturb the
+network (a dropout mask, a resampled weight) and run it many times, using
+the spread of the answers as the uncertainty. For a genuinely different
+comparison point, and to test whether a library could offload real
+complexity (not just re-implement what we already had), we added
+`DistanceNetMobileNetDER` using
+[TorchUncertainty](https://github.com/ENSTA-U2IS-AI/torch-uncertainty)'s
+`NormalInverseGammaLinear` layer and `DERLoss` — **Deep Evidential
+Regression** (Amini et al., 2020).
+
+**The idea:** instead of predicting `(mean, log_var)` and needing many
+stochastic passes to separate aleatoric from epistemic uncertainty, this
+model's head predicts **four numbers** in one deterministic forward pass
+— `loc`, `lambda`, `alpha`, `beta`, the parameters of a
+Normal-Inverse-Gamma (NIG) distribution over "what the mean and variance
+of a Gaussian for this input probably are." Both uncertainty types come
+out as closed-form properties of that distribution, no sampling needed:
+
+```
+aleatoric_var = beta / (alpha - 1)
+epistemic_var = beta / ((alpha - 1) * lambda)
+```
+
+Trained with `DERLoss`: the NIG distribution's negative log-likelihood,
+plus a regularizer (`reg_weight * |target - loc| * (2*lambda + alpha)`)
+whose *intended* job is to shrink `alpha`/`lambda` ("evidence") whenever
+the prediction is wrong — that's how this loss represents "I don't know,"
+not a bug to be fixed.
+
+**Dependency note:** `torch-uncertainty`'s package unconditionally
+imports a full PyTorch Lightning CLI/trainer stack even just to reach
+`torch_uncertainty.layers` — importing it pulled in `lightning`, `rich`,
+`torchmetrics`, `pandas`, `seaborn`, and more, none of which this project
+uses for anything beyond that one import. A noticeably heavier dependency
+than BLiTZ's clean, lightweight import.
+
+### Obstacle G: evidence collapsed to its numerical floor, blowing up both variance formulas
+
+**Symptom:** first full run (`reg_weight=1e-2`, the library's own
+`min_alpha`/`min_lmbda=1e-6` defaults). Point predictions (`loc`) looked
+reasonable, but `epistemic_std` came out in the tens of thousands and
+`aleatoric_std` in the thousands, for almost every image.
+
+**Diagnosis:** read the raw evidential parameters directly rather than
+trusting the derived stats. `alpha` sat at `1.000001` — exactly its floor
+(`1 + min_alpha`) — for 7 of 8 test images, with `lmbda` similarly tiny
+(`0.0009-0.003`). Plugging those into the formulas above reproduced the
+observed `aleatoric_std`/`epistemic_std` numbers exactly: dividing by a
+denominator of `~1e-6` (or `~1e-12` for the epistemic formula, which
+divides by `(alpha-1)*lmbda`, both near their floors) turns a small
+`beta` into an astronomical variance.
+
+**First fix tried, and why it didn't work:** raised `reg_weight` 100x
+(1e-2 -> 1.0), reasoning that a stronger regularizer would push evidence
+away from collapsing. A full 50-epoch run showed `alpha`/`lmbda` pinned
+at *exactly* their floor for every single epoch, completely unmoved by
+the 100x change — this was the tell that `reg_weight` wasn't the
+controlling lever at all. Re-reading the regularizer's formula confirmed
+why: minimizing `|target - loc| * (2*lambda + alpha)` pushes evidence
+*down* whenever the residual is nonzero, and on this task the residual is
+essentially never zero (even a well-converged model still has real
+error), so that pressure never lets up regardless of how strongly it's
+weighted. `reg_weight` controls *how hard* evidence gets pushed down, not
+*how low* it's allowed to go.
+
+**Real fix:** raised `min_alpha`/`min_lmbda` from the library's default
+of `1e-6` to `0.05`, exposed as constructor parameters on
+`DistanceNetMobileNetDER`. This doesn't stop evidence from collapsing —
+it bounds how extreme the consequence of that collapse can be: worst-case
+`(alpha-1)*lmbda` went from `~1e-12` to `~0.0025`, nine orders of
+magnitude better.
+
+### Obstacle H: the floor fix revealed a deeper, still-open problem
+
+**Symptom:** with the raised floors, `epistemic_std`/`aleatoric_std`
+stopped being astronomical — but `alpha`'s and `lmbda`'s **mean now
+equalled their min**, epoch after epoch. Every image was getting
+*identical* evidence, pinned exactly at the new floor. Not exploding
+anymore, but also carrying zero information — the model saying the exact
+same "I'm not sure" regardless of what it saw.
+
+**Why (best understanding so far):** `DERLoss`'s regularizer creates a
+"cop-out" the model has little incentive to leave. Near `alpha=1`, the
+NIG's predictive distribution develops very heavy tails, so almost any
+residual gets an acceptable log-likelihood without needing an accurate
+`loc` or informative `beta`. Since real residual is present on
+essentially every training example throughout training, and nothing in
+this loss specifically rewards *high* evidence when the model is doing
+well on a given input, the model settles into "always claim minimum
+confidence" and has no pressure to leave. This matches a documented
+critique of the original DER formulation in follow-up literature (not
+something specific to this project's setup).
+
+**Ablation tried:** set `reg_weight=0.0` entirely, as a clean test of
+whether the regularizer itself (not its magnitude) is the cause. A short
+smoke test (5 epochs, 32 samples) showed `alpha` still drifting toward
+its floor on its own — so the NLL term alone also favors low evidence for
+large residuals, this isn't purely the regularizer's doing — but `lmbda`
+showed real per-image spread for the first time (`min=0.156` vs.
+`mean=0.211` by epoch 5, instead of min essentially equal to mean every
+run before). A full run with `reg_weight=0.0` was kicked off next; last
+reported status was "seems to be doing fine," but the exact final
+`alpha`/`lmbda` numbers from that run and a fresh `compare_uncertainty.py`
+printout haven't been captured here yet — **verify those before trusting
+this is actually fixed**, the way every other claimed fix in this project
+has been verified with real printed numbers, not just a training curve
+that looks OK.
+
+**Not yet tried:** annealing `reg_weight` up from 0 over training (risk:
+may just delay Obstacle G's collapse to later epochs, the same
+warm-up-band-aid pattern that failed in Obstacle B); a modified
+evidential regularizer from follow-up DER literature designed to fix
+exactly this "uniform minimum evidence" pathology; checking whether
+`torch_uncertainty` ships an alternative loss that already addresses it.
+
+---
+
+## Part 7 — Comparing all four after a real 50-epoch run, and correcting an over-optimistic read
+
+The `reg_weight=0.0` run from Obstacle H finished, and
+`compare_uncertainty.py` was run across all four checkpoints on the same
+8 test images:
+
+```
+true |         dropout          |       variational        |          blitz           |           der
+       |      mean ep_std al_std |      mean ep_std al_std |      mean ep_std al_std |      mean ep_std al_std
+------------------------------------------------------------------------------------------------------------
+ 387.2 |     350.7  55.74 109.89 |     346.6  63.83 247.65 |     337.7   0.11  65.57 |     381.3 263.16  58.84
+ 220.0 |     297.8  45.84  92.28 |     297.4  45.46   0.01 |     285.5   0.12  77.49 |     269.1  90.47  20.23
+ 429.4 |     326.6  48.33 113.12 |     328.7  60.10   0.01 |     316.8   0.11  99.70 |     371.4 258.44  57.79
+ 349.0 |     312.0  53.58 106.96 |     329.0  41.63   0.01 |     295.4   0.09  83.98 |     355.2 215.85  48.27
+  48.0 |      82.8  15.90  46.25 |      92.3  33.32   0.01 |     144.0   0.08 135.55 |      56.1   8.02   3.89
+ 487.8 |     312.1  36.16 102.55 |     310.1  50.88   0.01 |     281.7   0.09  76.46 |     342.1 151.17  33.80
+ 380.8 |     350.3  43.72 111.49 |     336.7  63.21   0.01 |     319.8   0.10  82.07 |     381.5 264.93  59.24
+ 393.2 |     387.3  58.42 109.97 |     403.3  85.11   0.01 |     357.8   0.13  63.22 |     435.3 276.25  61.77
+```
+
+**`dropout`** — unchanged from every previous run. Mean tracks `true`
+reasonably (worst at the range's extremes: `48 -> 82.8`, `487.8 -> 312.1`
+— the hardest region of the task, per the dataset's own radius clamp).
+Both uncertainty types vary sensibly. The stable baseline this whole
+project measures everything else against.
+
+**`variational`** — mean quality comparable to dropout. `aleatoric_std`
+is `0.01` for 6 of 8 images here (one at exactly `0.01`... wait, 6 of the
+7 non-first rows are `0.01`, only the first row shows `247.65`) —
+Obstacle E's collapse is still present, unresolved, exactly as documented.
+Not a new finding, just a reconfirmation.
+
+**`blitz`** — mean noticeably weaker at the range's extremes than
+dropout/DER (`429.4 -> 316.8`, `487.8 -> 281.7`, both large undershoots).
+`epistemic_std` is `0.08-0.13` for every image — Obstacle F's collapse,
+also unresolved, also just a reconfirmation.
+
+**`der`** — this is the one with something genuinely new to check. Mean
+accuracy is competitive with (arguably the best of) the four models
+here — `380.8 -> 381.5`, `349.0 -> 355.2` are both excellent. Both
+`epistemic_std` and `aleatoric_std` show real per-image spread instead of
+one constant value, which is what the `reg_weight=0.0` ablation was
+hoping for.
+
+**But read the raw parameters before believing that's actually fixed.**
+Checking `alpha`/`lmbda`/`beta` directly for these same 8 images:
+
+```
+true= 387.2  loc=  381.3  err=   5.9  lmbda=0.0500  alpha=1.0500  beta=173.1275
+true= 220.0  loc=  269.1  err=  49.1  lmbda=0.0500  alpha=1.3837  beta=157.0406
+true= 429.4  loc=  371.4  err=  58.0  lmbda=0.0500  alpha=1.0500  beta=166.9803
+true= 349.0  loc=  355.2  err=   6.2  lmbda=0.0500  alpha=1.0753  beta=175.4777
+true=  48.0  loc=   56.1  err=   8.1  lmbda=0.2353  alpha=5.0105  beta= 60.6642
+true= 487.8  loc=  342.1  err= 145.8  lmbda=0.0500  alpha=1.1463  beta=167.1351
+true= 380.8  loc=  381.5  err=   0.7  lmbda=0.0500  alpha=1.0500  beta=175.4652
+true= 393.2  loc=  435.3  err=  42.0  lmbda=0.0500  alpha=1.0500  beta=190.7812
+```
+
+`lmbda` — the parameter that specifically drives *epistemic* uncertainty
+(`epistemic_var = beta / ((alpha-1) * lmbda)`) — is pinned at exactly its
+floor (`0.0500`) for **7 of the 8 images**, and only escapes for the one
+easiest, closest image (`true=48`, the same image that's been the one
+outlier throughout this entire DER saga, going all the way back to
+Obstacle G). Recomputing `epistemic_var` for those 7 rows using only
+`alpha`'s small movements above its own floor (`1.0500` to `1.3837`) and
+`beta` reproduces the reported `epistemic_std` values exactly (e.g.
+`true=349`: `175.4777 / (0.0753 * 0.05) = 46608`, `sqrt = 215.9`, matching
+the printed `215.85`). So the apparent per-image differentiation in
+`epistemic_std` is real, but it's coming entirely from `alpha` and
+`beta`, not from `lmbda` doing the job it's meant to do. Obstacle H's
+core finding — evidence collapsing to a floor value with no real
+per-input signal — is **not fixed**, just partially masked: `alpha`
+partially escaped the "cop-out" attractor with `reg_weight=0`, `lmbda`
+did not, except for the one image easy enough to pull it away.
+
+This corrects the too-optimistic framing at the end of Obstacle H, which
+was based on a 5-epoch/32-sample smoke test showing early `lmbda` spread
+that did not survive to the end of a full 50-epoch run. Lesson, stated
+plainly so it isn't repeated: **a promising trend in a tiny smoke test is
+not the same as a verified fix** — this project's own standard, applied
+to itself.
+
+One more real observation worth flagging as an open question rather than
+a conclusion: `epistemic_std` does not clearly track *accuracy*. The
+`true=380.8` row has the smallest error of any image here (`0.7`) and one
+of the *highest* reported epistemic uncertainties (`264.93`); the
+`true=487.8` row has the largest error (`145.8`) and a comparatively
+*lower* epistemic uncertainty (`151.17`) than several much more accurate
+predictions. Differentiation across images is not the same thing as
+calibration (uncertainty correlating with actual error) — this data has
+the former for `alpha`/`beta`, but whether it has the latter is still an
+open question, not yet checked systematically.
+
+**Where this actually leaves DER:** point predictions are good — possibly
+the best of the four models on this test batch. `alpha`/`beta` produce
+real per-image variation; `lmbda` still collapses to its floor for
+essentially everything, and whether the resulting uncertainty is
+*calibrated* (not just non-constant) hasn't been verified.
+
+---
+
+## Appendix: design rationale not tied to a specific obstacle
+
+Reference material moved here from README.md to keep that document short
+and skimmable. Nothing below is chronological — it's the "why" behind
+decisions that didn't come from debugging a specific failure.
+
+### Why predict `log_var` instead of `var` directly
+
+Variance must be positive. Predicting `log_var` and exponentiating it
+(`var = exp(log_var)`) gets positivity for free from an unconstrained
+linear output, no constrained activation needed.
+
+### Why this design actually works, in three points
+
+1. **The mean must keep learning even while the variance branch trains.**
+   Beta-NLL decouples the mean's gradient from the variance's current
+   value (Obstacle B/Part 3), so the two branches don't fight.
+2. **The variance must be free to move wherever the model's actual error
+   scale requires**, in either direction — for this 1-500 range, an
+   inaccurate mean can mean squared errors in the hundreds of thousands.
+   The soft `tanh` bound, calibrated from the task's real worst case
+   (Obstacle C), keeps that headroom available.
+3. **Each uncertainty type must come from a mechanism that targets what
+   it claims to measure.** Aleatoric noise is a property of a single
+   input, so it's a direct per-input model output trained with a proper
+   scoring rule (NLL). Epistemic uncertainty is about the model's
+   confidence in its own weights, so it's estimated by literally
+   perturbing the weights (dropout, or real weight resampling) and
+   watching how much the answer changes.
+
+### Alternatives considered for the architecture (point estimate)
+
+| Approach | Verdict |
+|---|---|
+| Plain MLP on flattened pixels | Rejected outright — no notion of spatial locality; would have to relearn "what an edge looks like" separately at every position, and the object's position is random per sample. |
+| Small CNN from scratch (`DistanceNet`) | Kept as the simple baseline; needs more data/epochs than a pretrained backbone. |
+| **Frozen pretrained backbone + small head (`DistanceNetMobileNet`, chosen)** | ImageNet features already encode general shape/edge/texture detectors, so only a small head has to be learned from a few thousand synthetic images — closer to how real-world "distance from a photo" systems are built. |
+| Deeper ResNet / Vision Transformer from scratch | Set aside — more parameters to fit with no pretraining benefit, higher compute, no clear win for a task this constrained. |
+| Classical (non-deep) CV, e.g. contour detection + calibrated size formula | Would work unusually well here specifically, since the task's structure is simple enough to hand-engineer. Set aside because the point of the project is learning PyTorch / uncertainty estimation, not because it's a bad idea for this narrow task. |
+
+### Alternatives considered for the uncertainty mechanism
+
+| Approach | Trade-off |
+|---|---|
+| No uncertainty (bare point regression) | Simplest, but defeats the entire purpose of the project. |
+| Heteroscedastic NLL head only (aleatoric) | Cheap, one forward pass, but can't distinguish "genuinely ambiguous input" from "model hasn't learned this region yet." |
+| MC Dropout only (epistemic) | Also cheap, but says nothing about irreducible per-input ambiguity — would report low uncertainty on a confidently-wrong-because-genuinely-ambiguous case. |
+| **Both combined (Kendall & Gal 2017) — used for the dropout and both variational models** | Best signal per unit of engineering/compute for a project also trying to keep training stable. |
+| Deep Ensembles (Lakshminarayanan et al., 2017) | Better-calibrated epistemic estimate than MC Dropout in general, but N× training time/checkpoints/memory — steep for a learning project, and most of that cost would be spent retraining near-identical heads given the frozen backbone. Not implemented. |
+| **Full variational / Bayes by Backprop — implemented twice (Part 4, Part 5)** | The "real" version of what MC Dropout approximates. More principled, at the cost of doubled parameter count and a KL term needing its own tuning (see Obstacles D-F). |
+| **Deep Evidential Regression — implemented (Part 6)** | Single deterministic pass, no sampling of any kind, cheapest at inference. Trades that for a regularization weight and evidence floor that need their own calibration (see Obstacles G-H). |
+| Quantile regression (pinball loss) | More robust to non-Gaussian error distributions, but doesn't naturally decompose into aleatoric vs. epistemic — you get an interval, not a "why." Not implemented. |
+| Conformal prediction | Model-agnostic, gives a statistical coverage guarantee the others don't — but it's a calibration wrapper around an existing estimator, not a replacement, and still doesn't decompose the "why." Worth layering on top later. Not implemented. |
+
+The common thread across everything set aside: it either didn't produce
+the aleatoric/epistemic decomposition this project specifically wants, or
+it multiplied cost (more models, more parameters, less stable training)
+for a gain that didn't clearly pay for itself at this project's scale.

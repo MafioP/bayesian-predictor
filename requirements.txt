@@ -1,0 +1,24 @@
+# torch/torchvision here need a CUDA build to use the GPU -- installed from
+# PyTorch's own index instead of plain PyPI, e.g.:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+# (see SESSION_NOTES.md, section 1.5). Plain `pip install -r requirements.txt`
+# will pull the CPU-only build instead.
+torch
+torchvision
+
+numpy
+Pillow
+matplotlib
+
+# Bayes by Backprop layers (see model.py's DistanceNetMobileNetBlitz)
+blitz-bayesian-pytorch
+
+# Deep Evidential Regression layer + loss (see model.py's DistanceNetMobileNetDER).
+# torch-uncertainty's own package doesn't declare `lightning`/`rich` as hard
+# dependencies, but its top-level __init__.py imports them unconditionally --
+# even `import torch_uncertainty.layers` fails without both installed. Not
+# used for anything in this project beyond that import; listed explicitly
+# since `pip install torch-uncertainty` alone will not be enough.
+torch-uncertainty
+lightning
+rich
