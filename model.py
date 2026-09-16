@@ -390,6 +390,17 @@ class DistanceNetMobileNetDER(nn.Module):
         if freeze_backbone:
             for p in self.backbone.parameters():
                 p.requires_grad = False
+            # Also freeze the mode itself here, not just via the train()
+            # override below. PyTorch Lightning (train_der.py) snapshots
+            # every submodule's train/eval flag individually before its
+            # automatic pre-training "sanity check" validation run, and
+            # restores that exact snapshot after every later validation
+            # too -- silently overriding the train() override's effect for
+            # the entire rest of training if the very first snapshot,
+            # taken before anyone has called .train() yet, sees a
+            # freshly-constructed (default: train-mode) backbone. Starting
+            # in eval() here means that first snapshot is already correct.
+            self.backbone.eval()
 
         self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))

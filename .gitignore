@@ -5,3 +5,5 @@ __pycache__/
 # Trained checkpoints and generated output -- regenerate with main.py / inference.py
 *.pt
 predictions.png
+lightning_logs
+checkpoints

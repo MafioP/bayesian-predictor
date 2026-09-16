@@ -36,10 +36,14 @@ MODEL_CHOICES = {
 # The "dropout" default keeps its original filename so existing checkpoints
 # and inference.py's default CHECKPOINT_PATH keep working unchanged.
 DEFAULT_CHECKPOINTS = {
-    "dropout": "distance_net.pt",
-    "variational": "distance_net_variational.pt",
-    "blitz": "distance_net_blitz.pt",
+    # "dropout": "distance_net.pt",
+    # "variational": "distance_net_variational.pt",
+    # "blitz": "distance_net_blitz.pt",
     "der": "distance_net_der.pt",
+    # Trained by train_der.py (TorchUncertainty's RegressionRoutine/TUTrainer),
+    # not by `main.py --model der` -- listed here only so
+    # compare_uncertainty.py can load it alongside the other checkpoints.
+    "der_tu": "distance_net_der_tu.pt",
 }
 
 

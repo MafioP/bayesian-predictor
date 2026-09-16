@@ -655,6 +655,121 @@ essentially everything, and whether the resulting uncertainty is
 
 ---
 
+## Part 8 — Rewriting DER's training with TorchUncertainty's own routine, and a real Lightning bug
+
+Asked to rewrite DER's training using TorchUncertainty's own recommended
+pattern (`RegressionRoutine` + `TUTrainer`, per
+[their DER tutorial](https://torch-uncertainty.github.io/auto_tutorials/Regression/tutorial_der_cubic.html))
+instead of `train.py`'s hand-rolled loop, to see whether their own,
+presumably better-tested training machinery handles this model any
+differently. Scoped to a new `train_der.py`, leaving `train.py` and every
+other model untouched.
+
+**Dependency cost, found before writing any code:** importing
+`torch_uncertainty.routines.RegressionRoutine` transitively imports the
+*classification* routine module too (the package doesn't cleanly separate
+these), which requires `timm` -- a large computer-vision model zoo,
+pulled in solely for a `Mixup` augmentation feature never used here.
+Combined with `lightning`/`rich`/`pandas`/`seaborn`/`huggingface_hub`
+from Part 6, this is a fourth or fifth unrelated dependency added just to
+reach one class.
+
+**Integration turned out to be clean.** `DistanceNetMobileNetDER.forward()`
+already returns the exact `{loc, lmbda, alpha, beta}` dict shape
+`RegressionRoutine` expects for `dist_family="nig"` (it constructs
+`NormalInverseGamma(**out)` internally and calls `DERLoss` on the result)
+-- zero changes needed to `model.py` for the wiring itself. `optim_recipe`
+is a plain callable `(model) -> optimizer`, and `TUTrainer`'s
+`gradient_clip_val` directly replaces the manual
+`clip_grad_norm_` call. Checkpoint saved in the same
+`{"model_cls", "state_dict"}` format as everywhere else
+(`distance_net_der_tu.pt`), so `inference.py`/`compare_uncertainty.py`
+needed no changes.
+
+### Obstacle I: a real, subtle Lightning bug -- the frozen backbone wasn't actually frozen
+
+**Symptom:** a full 50-epoch `train_der.py` run produced meaningfully
+worse results than the manual-loop `der` checkpoint on the same test
+images -- both worse mean accuracy (several large misses where `der` was
+accurate) and uniformly higher uncertainty of both kinds.
+
+**First (wrong) hypothesis:** suspected `DistanceNetMobileNetDER` was
+missing the `train()` override every other model class has (which forces
+`self.backbone.eval()` to keep BatchNorm's running statistics from
+drifting, since BatchNorm updates its running mean/var on every forward
+pass in train mode *regardless of `requires_grad`* -- freezing gradients
+does not freeze those statistics). This turned out to be wrong: the
+override was there and, when called directly, worked correctly (verified
+by constructing a `RegressionRoutine` and calling `.train()`/`.eval()` on
+it by hand -- `backbone.training` came out `False` as expected).
+
+**Diagnosis, done properly this time (traced the actual mechanism instead
+of guessing a second time):** monkey-patched `nn.Module.__setattr__` to
+catch the exact moment `backbone.training` became `True` during a real
+`trainer.fit()` call, with a stack trace. Root cause: Lightning has a
+`_ModuleMode` helper (`lightning/pytorch/utilities/model_helpers.py`)
+that, before *every* validation phase, snapshots the `.training` flag of
+every submodule *individually by name* (`capture()`), runs validation in
+eval mode, then restores each submodule to exactly what was captured
+(`restore()`) -- a deliberate mechanism meant to *preserve* custom
+per-submodule train/eval setups like this project's frozen backbone
+across a validation phase.
+
+The bug: Lightning also runs an automatic "sanity check" -- a couple of
+validation batches *before the first training epoch even starts*, to
+catch validation bugs early. `_ModuleMode.capture()` runs before that
+sanity check too, at a point when nobody has ever called `.train()` on
+the freshly-constructed model yet -- so it captures every submodule's raw
+post-`__init__` default (`training=True`, including the "frozen"
+backbone, since the `train()` override only takes effect when actually
+invoked). That bad snapshot then gets *restored* after the sanity check,
+and every subsequent validation re-captures and re-restores that same
+bad state, since nothing in Lightning's own control flow ever explicitly
+re-invokes our override in between. `train.py`'s manual loop never hits
+this because it calls `model.train()` itself at the start of every epoch,
+before any Lightning-style snapshotting exists to interfere.
+
+**Fix:** freeze the backbone into `eval()` mode at *construction time*
+(inside `__init__`), not only inside the `train()` override -- so the
+very first snapshot, whenever it happens to be taken, is already correct.
+One line in `model.py`, nothing else touched:
+
+```python
+if freeze_backbone:
+    for p in self.backbone.parameters():
+        p.requires_grad = False
+    self.backbone.eval()
+```
+
+Verified directly: `num_batches_tracked` delta across a real `fit()` run
+went from a full match to the batch count (100% drift) to exactly `0`.
+Lightning even prints a confirming warning ("Found 202 module(s) in eval
+mode at the start of training... if this is intentional, you can ignore
+this warning") -- which it is.
+
+**Result after the fix:** a full retrain of `der_tu` now tracks the
+manual-loop `der` checkpoint closely on the same 8 test images -- mean
+predictions and both uncertainty types are in the same range, no longer
+the systematic across-the-board degradation seen before. This also means
+the Obstacle H investigation (lmbda collapsing to its floor for 7 of 8
+images) was very likely confounded by this bug at least partially for
+`der_tu`'s numbers specifically, though `der`'s own checkpoint (trained
+via `train.py`, which never had this bug) showed the same `lmbda`
+collapse independently -- so Obstacle H's core finding stands on its own,
+this was a second, compounding issue specific to the Lightning path, not
+the explanation for the original finding.
+
+**Worth remembering beyond this project:** this class of bug -- a frozen
+submodule silently un-freezing under a training framework whose lifecycle
+you don't fully control -- is easy to miss because the model still trains
+without erroring, and the point predictions can still look reasonable.
+The only way it surfaced here was checking a BatchNorm buffer directly
+against a fresh, untrained instance of the same class, the same
+"read the raw numbers, don't trust the summary" habit that's caught every
+real bug in this project so far.
+
+---
+
 ## Appendix: design rationale not tied to a specific obstacle
 
 Reference material moved here from README.md to keep that document short
